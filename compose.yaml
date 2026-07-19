@@ -1,0 +1,29 @@
+name: strata-development
+
+services:
+  postgres:
+    build:
+      context: ./docker/postgres
+      dockerfile: Dockerfile
+    image: strata-postgres-fixtures:17
+    container_name: strata-postgres-dev
+    environment:
+      POSTGRES_DB: strata
+      POSTGRES_USER: strata
+      POSTGRES_PASSWORD: strata_dev
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U strata -d operations_hub && psql -U strata -d operations_hub -tAc \"SELECT count(*) FROM public.strata_fixture_manifest WHERE fixture_version = '2026-07-19-v1'\" | grep -qx 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+    volumes:
+      - strata-postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  strata-postgres-data:

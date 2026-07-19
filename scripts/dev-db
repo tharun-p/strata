@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$project_root"
+
+command="${1:-up}"
+database="${2:-strata}"
+
+case "$command" in
+  up)
+    docker compose up -d --build --wait postgres
+    echo "Strata PostgreSQL is ready on 127.0.0.1:55432"
+    echo "Databases: strata, saas_control, operations_hub"
+    ;;
+  down)
+    docker compose down
+    ;;
+  reset)
+    docker compose down --volumes
+    docker compose up -d --build --wait postgres
+    echo "Strata PostgreSQL was rebuilt with all three databases"
+    ;;
+  status)
+    docker compose ps
+    ;;
+  psql)
+    docker compose exec postgres psql -U strata -d "$database"
+    ;;
+  verify)
+    docker/postgres/verify.sh
+    ;;
+  *)
+    echo "Usage: scripts/dev-db [up|down|reset|status|verify|psql [database]]" >&2
+    exit 2
+    ;;
+esac
