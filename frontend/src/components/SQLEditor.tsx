@@ -18,6 +18,7 @@ import {
 } from '@codemirror/language'
 import { highlightSelectionMatches, searchKeymap } from '@codemirror/search'
 import {
+  type ChangeDesc,
   Compartment,
   EditorSelection,
   EditorState,
@@ -28,10 +29,9 @@ import {
 import {
   Decoration,
   EditorView,
-  ViewPlugin,
+  WidgetType,
   type DecorationSet,
   type LayerMarker,
-  type ViewUpdate,
   crosshairCursor,
   drawSelection,
   dropCursor,
@@ -116,7 +116,14 @@ const statementIndexField = StateField.define<StatementIndex>({
   create: () => ({ documentRevision: 0, indexedRevision: -1, ranges: new Uint32Array() }),
   update(value, transaction) {
     let next = transaction.docChanged
-      ? { ...value, documentRevision: value.documentRevision + 1 }
+      ? {
+          ...value,
+          documentRevision: value.documentRevision + 1,
+          // Keep the previous worker result visually aligned while the next
+          // authoritative index is in flight. Execution still checks the
+          // revision and waits for the worker before using these ranges.
+          ranges: mapStatementRanges(value.ranges, transaction.changes),
+        }
       : value
     for (const effect of transaction.effects) {
       if (effect.is(setStatementIndex) && effect.value.revision === next.documentRevision) {
@@ -130,7 +137,7 @@ const statementIndexField = StateField.define<StatementIndex>({
 type EditorController = {
   documentId: string
   disabled: boolean
-  requestExecution: (documentId: string, revision: number, kind: SQLExecutionRequest['kind'], statementIndex?: number) => void
+  requestExecution: (documentId: string, kind: SQLExecutionRequest['kind'], statementIndex?: number) => void
 }
 
 function targetForState(documentId: string, state: EditorState): SQLExecutionTarget | null {
@@ -145,7 +152,9 @@ function targetForState(documentId: string, state: EditorState): SQLExecutionTar
       statementCount: indexed.indexedRevision === indexed.documentRevision ? indexed.ranges.length / 2 : 0,
     }
   }
-  if (indexed.indexedRevision !== indexed.documentRevision) return null
+  // The ranges are mapped through every local edit while the worker catches
+  // up. They are safe for keeping the UI target stable, but execution still
+  // waits for an authoritative range set in requestExecution below.
   const head = selection.head
   const statementIndex = statementIndexAtOrAfter(indexed.ranges, head)
   if (statementIndex >= 0) {
@@ -182,16 +191,86 @@ function statementIndexAtOrAfter(packed: Uint32Array, position: number) {
   return count - 1
 }
 
+function mapStatementRanges(packed: Uint32Array, changes: ChangeDesc) {
+  if (packed.length === 0 || changes.empty) return packed
+  // Full Query bands are capped at 500 statements. Larger documents use
+  // compact controls and must not remap a 100k-entry index on the UI thread;
+  // their worker result replaces these transient ranges shortly afterward.
+  if (packed.length / 2 > FULL_CONTROL_MAX_STATEMENTS) return packed
+  const mapped: number[] = []
+  for (let cursor = 0; cursor < packed.length; cursor += 2) {
+    const from = changes.mapPos(packed[cursor], -1)
+    const to = changes.mapPos(packed[cursor + 1], 1)
+    if (to > from) mapped.push(from, to)
+  }
+  return Uint32Array.from(mapped)
+}
+
+class QueryControlWidget extends WidgetType {
+  constructor(
+    readonly statementIndex: number,
+    readonly documentId: string,
+    readonly disabled: boolean,
+    readonly controller: EditorController,
+  ) {
+    super()
+  }
+
+  eq(other: WidgetType) {
+    return other instanceof QueryControlWidget
+      && other.statementIndex === this.statementIndex
+      && other.documentId === this.documentId
+      && other.disabled === this.disabled
+  }
+
+  toDOM() {
+    const container = document.createElement('div')
+    container.className = 'cm-query-control full cm-query-control-widget'
+    const label = document.createElement('span')
+    label.textContent = `Query ${this.statementIndex + 1}`
+    container.append(label)
+    const button = document.createElement('button')
+    button.type = 'button'
+    this.configureButton(button)
+    button.addEventListener('mousedown', (event) => event.preventDefault())
+    button.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (!this.controller.disabled) this.controller.requestExecution(this.documentId, 'query', this.statementIndex)
+    })
+    container.append(button)
+    return container
+  }
+
+  updateDOM(dom: HTMLElement, _view: EditorView, previous: this) {
+    if (!(previous instanceof QueryControlWidget)
+      || previous.statementIndex !== this.statementIndex
+      || previous.documentId !== this.documentId) return false
+    const button = dom.querySelector('button')
+    if (button) this.configureButton(button)
+    return true
+  }
+
+  get estimatedHeight() {
+    return 43
+  }
+
+  private configureButton(button: HTMLButtonElement) {
+    button.disabled = this.disabled
+    button.setAttribute('aria-label', `Run Query ${this.statementIndex + 1}`)
+    button.title = this.disabled ? 'Connect a database to run this query' : `Run Query ${this.statementIndex + 1}`
+    button.textContent = '▶  Run'
+  }
+}
+
 class QueryControlMarker implements LayerMarker {
   constructor(
     readonly top: number,
     readonly left: number,
     readonly width: number,
     readonly statementIndex: number,
-    readonly sql: string,
     readonly compact: boolean,
     readonly documentId: string,
-    readonly revision: number,
     readonly disabled: boolean,
     readonly controller: EditorController,
   ) {}
@@ -202,10 +281,8 @@ class QueryControlMarker implements LayerMarker {
       && other.left === this.left
       && other.width === this.width
       && other.statementIndex === this.statementIndex
-      && other.sql === this.sql
       && other.compact === this.compact
       && other.documentId === this.documentId
-      && other.revision === this.revision
       && other.disabled === this.disabled
   }
 
@@ -231,10 +308,26 @@ class QueryControlMarker implements LayerMarker {
     button.addEventListener('click', (event) => {
       event.preventDefault()
       event.stopPropagation()
-      if (!this.disabled) this.controller.requestExecution(this.documentId, this.revision, 'query', this.statementIndex)
+      if (!this.controller.disabled) this.controller.requestExecution(this.documentId, 'query', this.statementIndex)
     })
     container.append(button)
     return container
+  }
+
+  update(dom: HTMLElement, oldMarker: LayerMarker) {
+    if (!(oldMarker instanceof QueryControlMarker)
+      || oldMarker.statementIndex !== this.statementIndex
+      || oldMarker.compact !== this.compact
+      || oldMarker.documentId !== this.documentId) return false
+    dom.style.top = `${this.top}px`
+    dom.style.left = `${this.left}px`
+    if (!this.compact) dom.style.width = `${this.width}px`
+    const button = dom.querySelector('button')
+    if (button) {
+      button.disabled = this.disabled
+      button.title = this.disabled ? 'Connect a database to run this query' : `Run Query ${this.statementIndex + 1}`
+    }
+    return true
   }
 }
 
@@ -256,35 +349,58 @@ function visibleStatementIndexes(packed: Uint32Array, visibleFrom: number, visib
 }
 
 function statementControlsExtension(controller: EditorController): Extension {
-  const paddingPlugin = ViewPlugin.fromClass(class {
-    decorations: DecorationSet
+  const usesFullControls = (state: EditorState) => {
+    const indexed = state.field(statementIndexField)
+    return indexed.ranges.length / 2 <= FULL_CONTROL_MAX_STATEMENTS
+      && state.doc.length <= FULL_CONTROL_MAX_BYTES
+  }
 
-    constructor(view: EditorView) {
-      this.decorations = this.build(view.state)
+  const buildFullControls = (state: EditorState) => {
+    const indexed = state.field(statementIndexField)
+    if (!usesFullControls(state)) return Decoration.none
+    const decorations = []
+    const seen = new Set<number>()
+    for (let cursor = 0; cursor < indexed.ranges.length; cursor += 2) {
+      const lineStart = state.doc.lineAt(Math.min(indexed.ranges[cursor], state.doc.length)).from
+      if (seen.has(lineStart)) continue
+      seen.add(lineStart)
+      decorations.push(Decoration.widget({
+        widget: new QueryControlWidget(cursor / 2, controller.documentId, controller.disabled, controller),
+        block: true,
+        side: -1,
+      }).range(lineStart))
     }
+    return Decoration.set(decorations, true)
+  }
 
-    update(update: ViewUpdate) {
-      if (update.docChanged || update.transactions.some((transaction) => transaction.effects.some(
+  const sameFullControlLayout = (before: EditorState, after: EditorState) => {
+    const beforeRanges = before.field(statementIndexField).ranges
+    const afterRanges = after.field(statementIndexField).ranges
+    if (beforeRanges.length !== afterRanges.length) return false
+    for (let cursor = 0; cursor < beforeRanges.length; cursor += 2) {
+      const beforeLine = before.doc.lineAt(Math.min(beforeRanges[cursor], before.doc.length)).from
+      const afterLine = after.doc.lineAt(Math.min(afterRanges[cursor], after.doc.length)).from
+      if (beforeLine !== afterLine) return false
+    }
+    return true
+  }
+
+  // CodeMirror only accepts block decorations from a state field. Mapping the
+  // field through ordinary typing transactions preserves the widget instances
+  // and their DOM instead of tearing down and repainting every Run band.
+  const fullControlsField = StateField.define<DecorationSet>({
+    create: buildFullControls,
+    update(value, transaction) {
+      const controlsChanged = transaction.effects.some(
         (effect) => effect.is(setStatementIndex) || effect.is(refreshStatementControls),
-      ))) this.decorations = this.build(update.state)
-    }
-
-    private build(state: EditorState) {
-      const indexed = state.field(statementIndexField)
-      if (indexed.indexedRevision !== indexed.documentRevision
-        || indexed.ranges.length / 2 > FULL_CONTROL_MAX_STATEMENTS
-        || state.doc.length > FULL_CONTROL_MAX_BYTES) return Decoration.none
-      const decorations = []
-      const seen = new Set<number>()
-      for (let cursor = 0; cursor < indexed.ranges.length; cursor += 2) {
-        const lineStart = state.doc.lineAt(indexed.ranges[cursor]).from
-        if (seen.has(lineStart)) continue
-        seen.add(lineStart)
-        decorations.push(Decoration.line({ class: 'cm-statement-start' }).range(lineStart))
-      }
-      return Decoration.set(decorations, true)
-    }
-  }, { decorations: (plugin) => plugin.decorations })
+      )
+      const modeChanged = usesFullControls(transaction.startState) !== usesFullControls(transaction.state)
+      const disabledChanged = transaction.effects.some((effect) => effect.is(refreshStatementControls))
+      const layoutChanged = controlsChanged && !sameFullControlLayout(transaction.startState, transaction.state)
+      if (disabledChanged || layoutChanged || modeChanged) return buildFullControls(transaction.state)
+      return transaction.docChanged ? value.map(transaction.changes) : value
+    },
+  })
 
   const controlsLayer = layer({
     above: true,
@@ -295,8 +411,9 @@ function statementControlsExtension(controller: EditorController): Extension {
       || update.transactions.some((transaction) => transaction.effects.length > 0),
     markers(view) {
       const indexed = view.state.field(statementIndexField)
-      if (indexed.indexedRevision !== indexed.documentRevision || indexed.ranges.length === 0) return []
+      if (indexed.ranges.length === 0) return []
       const compact = indexed.ranges.length / 2 > FULL_CONTROL_MAX_STATEMENTS || view.state.doc.length > FULL_CONTROL_MAX_BYTES
+      if (!compact) return []
       const markers: QueryControlMarker[] = []
       const visibleIndexes = new Set<number>()
       for (const visible of view.visibleRanges) {
@@ -304,22 +421,18 @@ function statementControlsExtension(controller: EditorController): Extension {
       }
       const seenLines = new Set<number>()
       for (const statementIndex of visibleIndexes) {
-        const from = indexed.ranges[statementIndex * 2]
-        const to = indexed.ranges[statementIndex * 2 + 1]
+        const from = Math.min(indexed.ranges[statementIndex * 2], view.state.doc.length)
         const lineStart = view.state.doc.lineAt(from).from
-        if (!compact && seenLines.has(lineStart)) continue
+        if (seenLines.has(lineStart)) continue
         seenLines.add(lineStart)
-        const coordinates = view.coordsAtPos(from)
-        if (!coordinates) continue
+        const lineBlock = view.lineBlockAt(from)
         markers.push(new QueryControlMarker(
-          coordinates.top - view.documentTop - (compact ? 0 : 37),
-          compact ? 5 : 55,
-          Math.max(120, view.scrollDOM.clientWidth - (compact ? 8 : 68)),
+          lineBlock.top + Math.max(0, (lineBlock.height - 20) / 2),
+          5,
+          Math.max(120, view.scrollDOM.clientWidth - 8),
           statementIndex,
-          view.state.doc.sliceString(from, to).trim(),
           compact,
           controller.documentId,
-          indexed.documentRevision,
           controller.disabled,
           controller,
         ))
@@ -327,7 +440,7 @@ function statementControlsExtension(controller: EditorController): Extension {
       return markers
     },
   })
-  return [paddingPlugin, controlsLayer]
+  return [fullControlsField, EditorView.decorations.from(fullControlsField), controlsLayer]
 }
 
 const strataHighlight = HighlightStyle.define([
@@ -485,12 +598,13 @@ export const SQLEditor = forwardRef<SQLEditorHandle, Props>(function SQLEditor({
     })
   }
 
-  controllerRef.current.requestExecution = (targetDocumentId, revision, kind, statementIndex) => {
+  controllerRef.current.requestExecution = (targetDocumentId, kind, statementIndex) => {
     const view = viewRef.current
     const session = sessionStoreRef.current?.get(targetDocumentId)
     const state = targetDocumentId === currentDocumentRef.current ? view?.state : session?.state
     if (!state || controllerRef.current.disabled) return
     const indexed = state.field(statementIndexField)
+    const revision = indexed.documentRevision
     const selection = state.selection.main
     const snapshot = state.doc.toString()
     if (!selection.empty || indexed.indexedRevision === revision) {
@@ -532,8 +646,8 @@ export const SQLEditor = forwardRef<SQLEditorHandle, Props>(function SQLEditor({
       keymap.of([
         {
           key: 'Mod-Enter',
-          run: (view) => {
-            controllerRef.current.requestExecution(currentDocumentRef.current, view.state.field(statementIndexField).documentRevision, 'query')
+          run: () => {
+            controllerRef.current.requestExecution(currentDocumentRef.current, 'query')
             return true
           },
           preventDefault: true,
@@ -601,7 +715,7 @@ export const SQLEditor = forwardRef<SQLEditorHandle, Props>(function SQLEditor({
     requestExecution: (kind) => {
       const view = viewRef.current
       if (!view) return
-      controllerRef.current.requestExecution(currentDocumentRef.current, view.state.field(statementIndexField).documentRevision, kind)
+      controllerRef.current.requestExecution(currentDocumentRef.current, kind)
     },
   }), [])
 

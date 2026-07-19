@@ -587,7 +587,6 @@ kbd { font-family: inherit; font-size: 10px; color: #687281; background: #f2f4f7
 .editor-pane .cm-editor { height: 100% !important; position: relative; background: #fff !important; }
 .editor-pane .cm-scroller { overflow: auto; }
 .editor-pane .cm-editor.cm-focused { outline: none !important; }
-.editor-pane .cm-line.cm-statement-start { box-sizing: border-box; padding-top: 43px; }
 .cm-query-controls-layer {
   z-index: 4;
   pointer-events: none;
@@ -595,11 +594,13 @@ kbd { font-family: inherit; font-size: 10px; color: #687281; background: #f2f4f7
   -webkit-user-select: none;
 }
 .cm-query-control.full {
+  width: calc(100% - 16px);
   height: 34px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  margin: 4px 8px 5px;
   padding: 0 6px 0 9px;
   box-sizing: border-box;
   color: #7b8492;
