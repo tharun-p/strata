@@ -1,0 +1,22 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Strata",
+  "outputfilename": "Strata",
+  "frontend:dir": "frontend",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev -- --host 127.0.0.1",
+  "frontend:dev:serverUrl": "auto",
+  "devServer": "localhost:34116",
+  "author": {
+    "name": "Strata Contributors",
+    "email": ""
+  },
+  "info": {
+    "companyName": "Strata",
+    "productName": "Strata",
+    "productVersion": "0.1.0",
+    "copyright": "Copyright 2026 Strata Contributors",
+    "comments": "A PostgreSQL database studio built for investigation."
+  }
+}
