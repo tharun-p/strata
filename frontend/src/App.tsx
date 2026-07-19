@@ -803,11 +803,14 @@ function App() {
                     }}
                     onExecutionTargetChange={(target) => {
                       if (!executionLabelRef.current) return
-                      executionLabelRef.current.textContent = target?.kind === 'selection'
+                      const nextLabel = target?.kind === 'selection'
                         ? 'Run selection'
                         : target?.kind === 'statement' && target.statementCount > 1
                           ? `Run Query ${target.statementIndex + 1}`
                           : 'Run'
+                      if (executionLabelRef.current.textContent !== nextLabel) {
+                        executionLabelRef.current.textContent = nextLabel
+                      }
                     }}
                   />
                 </Suspense>

@@ -239,6 +239,12 @@ export function incrementallyLexPostgreSQLStatements(
   const totalDelta = changes.reduce((sum, change) => sum + change.insert.length - (change.to - change.from), 0)
   let prefixCount = previousRanges.findIndex((range) => range.to > earliest)
   if (prefixCount < 0) prefixCount = previousRanges.length
+  // A trailing malformed or unterminated statement is not a safe incremental
+  // prefix, even when an insertion lands exactly at its exclusive end. Reuse
+  // only ranges that PostgreSQL has definitively terminated with a semicolon.
+  while (prefixCount > 0 && previousText[previousRanges[prefixCount - 1].to - 1] !== ';') {
+    prefixCount -= 1
+  }
   const restart = prefixCount > 0 ? previousRanges[prefixCount - 1].to : 0
   const nextRestart = restart
   const prefix = previousRanges.slice(0, prefixCount).map((range, index) => ({ ...range, index }))

@@ -55,6 +55,19 @@ describe('PostgreSQL statement lexer', () => {
     expect(indexed.ranges).toHaveLength(3)
   })
 
+  it('keeps sequential characters in one unfinished trailing statement', () => {
+    let text = ''
+    let ranges = lexPostgreSQLStatements(text)
+    for (const character of 'SELECT customer_id FROM customers') {
+      const at = text.length
+      const indexed = incrementallyLexPostgreSQLStatements(text, ranges, [{ from: at, to: at, insert: character }])
+      text = indexed.text
+      ranges = indexed.ranges
+      expect(ranges).toEqual(lexPostgreSQLStatements(text))
+      expect(ranges).toHaveLength(1)
+    }
+  })
+
   it('expands incremental work when an edit changes lexical state across boundaries', () => {
     const original = 'SELECT 1;SELECT 2;SELECT 3;'
     const previous = lexPostgreSQLStatements(original)
